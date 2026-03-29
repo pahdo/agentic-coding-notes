@@ -220,6 +220,3 @@ Any questions? Please ask Daniel Zou
 - Obsidian
 
 ### Thanks for reading! Please feel free to suggest any improvements
-
----
-*Slide deck version: [github.com/pahdo/spc-dotfiles-demo](https://github.com/pahdo/spc-dotfiles-demo)*
