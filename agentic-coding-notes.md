@@ -220,3 +220,82 @@ Any questions? Please ask Daniel Zou
 - Obsidian
 
 ### Thanks for reading! Please feel free to suggest any improvements
+
+---
+
+## Building gmail-sync overnight: LRA + health-check pattern in practice - May 12, 2026
+
+A two-day case study: built a Gmail → workbook sync daemon (`~/myprojects/gmail-sync`) end-to-end using the long-running-agent (LRA) harness and the health-check module, mostly autonomously, mostly while blocked on a single external dependency (GCP OAuth credentials). The interesting parts are the patterns, not the project.
+
+### The fixture-gate pattern
+
+The whole project gated on one external action: download OAuth credentials from GCP console. Without `~/.config/gmail-sync/credentials.json`, every Gmail API call exits 1. Naively this blocks the LRA loop at task 2.
+
+What worked instead: implement each module against **synthetic fixtures**, treat the live verify step as a separate gate. Each `complete` call carries explicit "live verify deferred — gates on auth" in the feedback string, so the .progress.json log preserves the deferred-verifiability of every claim. Fixtures lived in `tests/fixtures/*.json` modeled on real Gmail API message shapes (plaintext, multipart-with-attachment, html-only).
+
+Net result: 67/67 fixture-driven tests covering converter, router, writer, state, sync orchestrator, daemon plist generator, retry logic. When credentials land, only the live verify needs to run — the structural soundness is already proved.
+
+**Transferable rule:** when an LRA task's `Verify` block needs an external dependency you don't have, encode the verification at the structural level (fixtures, schema checks, behavioral regression tests) and mark the live step as deferred-verifiable in the feedback. Do NOT mark `failed` — that stalls the loop. Do NOT mark `pass` without acknowledging the deferral — that produces silent under-implementation.
+
+### Watchdog state machines for asynchronous human handoffs
+
+Cron was blocked (macOS Sequoia FDA-requirement on Terminal modifying crontab — `Killed: 9` with no useful error). Switched to `launchd` `LaunchAgent` plists. Two agents at staggered cadence:
+
+- `com.pahdolabs.gmail-sync.overnight` — state-machine driver. Polls `~/.config/gmail-sync/credentials.json`, then `token.json`, then `~/Library/LaunchAgents/com.pahdolabs.gmail-sync.plist`. Each state transition triggers the next bootstrap step automatically.
+- `com.pahdolabs.gmail-sync.health` — runs `lra-checks run` every 30 min, writes JSON report + URGENT.md on blocker failures.
+
+The state machine means: the human places ONE file (`credentials.json`), runs ONE interactive command (`gmail-sync auth` — browser-required), and the system finishes bootstrapping itself within 30 minutes. No further human action.
+
+Concurrency safety: `fcntl.flock` at `~/.config/gmail-sync/sync.lock` for the Python sync process; atomic `mkdir`-based lock for the shell watchdog (`.overnight.lock.d/` with 1h stale-eviction). macOS does **not** ship `flock(1)` — the shell binary you'd reach for in Linux scripts is absent. `mkdir` is atomic on POSIX and works everywhere.
+
+### Health-check module: deterministic + LLM, with loop closure
+
+The LRA's `lra-checks` module mixes two check kinds:
+
+1. **Deterministic** (`.checks/*.yaml`): bash exit-code, fast (<1s), replayable. Codifies known failure modes.
+2. **LLM-graded** (`.checks/*.llm.md`): `claude -p` reads recent context (HANDOFF, PREFLIGHT, DESIGN, `.progress.json`), emits `RESULT: pass|fail`. Adapts to current risk surface; can spot drift a hardcoded list would miss.
+
+The promotion path: when the LLM check finds a real issue, *codify it as a deterministic check* so future ticks catch it without LLM cost. Example from this build:
+- LLM noticed HANDOFF.md claiming task 2 BLOCKED while `.progress.json` showed all 8 done → built `handoff-matches-progress.yaml` to grep the curated doc against the durable task log
+- LLM noticed `DESIGN.md` referencing `src/gmail_sync/lock.py` → built `design-references-real-modules.yaml` to assert every module DESIGN claims exists actually exists on disk
+
+**Transferable rule:** the LLM is for *discovering* drift modes; deterministic checks are for *defending against* known drift modes. Don't pay LLM cost forever for things you can codify.
+
+### Loop closure: the system catching its own staleness
+
+Highest-value moment of the session: the LLM coherence check found a real bug in MY code. Two CLI commands called `build_service()` without passing `state=`, so the `AUTH_EXPIRED` sentinel could never fire in production despite passing isolated unit tests. The check produced the diagnosis verbatim:
+
+> "auth.py implements `_record_failure`/`_record_success` ... but every CLI command (`auth`, `pull`, `labels`, `sync`, `status`, `doctor`) calls `build_service()` without passing `state=`, so the failure counter is never incremented in production paths."
+
+Fix: module-level `gmail.set_state()` setter wired via a `_build_service_with_state()` CLI helper. Plus `_retry` now catches 401/403 and increments the counter. Plus two new regression tests covering the 3x401→sentinel flow and the success→counter-reset flow.
+
+**The integration-vs-unit gap is exactly what LLM coherence checks are good for.** Unit tests pass against the *isolated helper*. LLM reads the call graph and spots that production code paths bypass the helper. This is silent-correctness-failure territory — the most expensive bug class.
+
+### The argv-ordering bug (parallel-agent coordination)
+
+A parallel agent landed a new `lra-checks` CLI mid-session, moving the LLM-grading machinery from `long-running-agent health-check` to its own binary. The new code had a subtle bug: `subprocess.run(["claude", "-p", "--add-dir", path, prompt])` — but `--add-dir` consumes the next positional, leaving `prompt` orphaned. Claude CLI rejects with "Input must be provided either through stdin or as a prompt argument". Confirmed by direct repro: swap to `claude --add-dir <path> -p <prompt>` and it works.
+
+Workaround without touching upstream code: a deterministic shim (`coherence-llm-shim.yaml`) that calls `claude` with correct argv ordering inside its own bash body, parses `RESULT:` itself, exits 0/1. Bypasses the broken LLM path entirely, gets the value back, retires when upstream fixes the bug.
+
+**Transferable rule:** when a parallel agent's surface has a bug you can route around with a shim, prefer the shim over blocking. Mark the upstream as known-broken in a HANDOFF/commit message so the other agent's session picks it up.
+
+### macOS-specific landmines
+
+- `crontab -` requires Full Disk Access on Sequoia+. Terminal/your shell needs FDA. Solution: launchd LaunchAgents, native to macOS, no permission grant required.
+- `flock(1)` doesn't exist. Use `mkdir` as atomic lock or write the lock script in Python with `fcntl.flock`.
+- `timeout(1)` doesn't exist by default. Either install coreutils (`gtimeout`) or rely on the outer caller's timeout (lra-checks enforces 180s on deterministic checks, 300s on LLM).
+- `host(1)` for DNS is BSD-flavored; piping to `dscacheutil -q host` is the macOS fallback.
+
+### What I'd skip next time
+
+- The codex adversarial-review step. First attempt hung 30+ min on stdin (heredoc didn't survive subprocess), second I never retried — the LLM coherence health check turned out to subsume the value (continuous adversarial loop vs one-shot review). Codex-as-debate makes sense for *design phase*; LLM-coherence-as-watchdog makes sense for *implementation+post*.
+
+- Pre-emptive `.gitignore` editing for runtime artifacts. The first time `.checks/history.jsonl` showed dirty, `.gitignore` didn't help because the file was already tracked. `git rm --cached <path>` is the unblock — the .gitignore takes effect once it's untracked. Cheap habit: any file the harness *writes during runtime* gets added to .gitignore the moment you commit its parent dir.
+
+### Concrete files for reference
+
+- `~/myprojects/gmail-sync/DESIGN.md` — locked decisions in their own subsections (P5 forward-only, P7.6 verbatim threads, P8.4 flock, P4.4 NFKD+ASCII)
+- `~/myprojects/gmail-sync/PREFLIGHT.md` — 10-category pre-execution gates
+- `~/myprojects/gmail-sync/.checks/` — 13 health checks (5 blocker, 7 warn, 1 info)
+- `~/myprojects/gmail-sync/scripts/overnight-tick.sh` — state-machine watchdog
+- `~/myprojects/long-running-agent/skill/HEALTHCHECK-MODULE.md` — full spec for the health-check pattern
